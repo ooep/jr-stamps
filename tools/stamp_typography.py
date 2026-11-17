@@ -15,15 +15,59 @@ stamp_typography.py — 駅スタンプ排版引擎
 字体: /usr/share/fonts/opentype/noto/NotoSansCJK-{w}.ttc, NotoSerifCJK-{w}.ttc
 """
 import math
+import os
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 SANS  = '/usr/share/fonts/opentype/noto/NotoSansCJK-{w}.ttc'
 SERIF = '/usr/share/fonts/opentype/noto/NotoSerifCJK-{w}.ttc'
 
-def F(kind, weight, sz):
+_FT_CACHE = {}
+_FALLBACK_W = ('Regular', 'Bold', 'Medium', 'Light')
+_FT_DIRS = ('/usr/share/fonts/opentype/noto',
+            '/usr/share/fonts/truetype/noto',
+            '/usr/share/fonts/noto-cjk')
+
+
+def _font_path(kind, weight):
+    """按字重取字体文件; 缺失时依次降级(精简环境只装 Regular/Bold 也不报错)"""
     tpl = SANS if kind == 'sans' else SERIF
-    return ImageFont.truetype(tpl.format(w=weight), sz, index=0)
+    cand = [weight] + [w for w in _FALLBACK_W if w != weight]
+    for w in cand:
+        p = tpl.format(w=w)
+        if os.path.exists(p):
+            return p
+    # 目录名不同(其他发行版)时按文件名模式找
+    stem = 'NotoSansCJK' if kind == 'sans' else 'NotoSerifCJK'
+    for d in _FT_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for w in cand:
+            p = os.path.join(d, f'{stem}-{w}.ttc')
+            if os.path.exists(p):
+                return p
+        for f in sorted(os.listdir(d)):
+            if f.startswith(stem) and f.endswith('.ttc'):
+                return os.path.join(d, f)
+    for w in cand:                                  # 最后回退任意 CJK 字体
+        for d, f in (('/usr/share/fonts/opentype/noto', f'{stem}-{w}.otf'),):
+            if os.path.exists(os.path.join(d, f)):
+                return os.path.join(d, f)
+    return tpl.format(w='Regular')
+
+
+def F(kind, weight, sz):
+    key = (kind, weight, int(sz))
+    f = _FT_CACHE.get(key)
+    if f is not None:
+        return f
+    path = _font_path(kind, weight)
+    try:
+        f = ImageFont.truetype(path, sz, index=0)
+    except OSError:
+        f = ImageFont.truetype(_font_path(kind, 'Regular'), sz, index=0)
+    _FT_CACHE[key] = f
+    return f
 
 def adv(f, ch):
     b = f.getbbox(ch)
