@@ -34,7 +34,10 @@ jobs:
           sudo apt-get install -y -qq fonts-noto-cjk > /dev/null
 
       - name: 安装依赖
-        run: pip install --quiet pillow
+        run: |
+          pip install --quiet pillow numpy
+          python3 -c "import PIL, numpy; print('pillow', PIL.__version__, '| numpy', numpy.__version__)"
+          python3 -c "import sys; sys.path.insert(0,'tools'); import stamp_render, stamp_typography, line_theme; print('渲染模块 OK')" 
 
       - name: 恢复清单缓存
         uses: actions/cache@v4
@@ -51,13 +54,24 @@ jobs:
         run: |
           set -u
           deadline=$(( $(date +%s) + ${HOURS%.*} * 3600 ))
-          round=0
+          round=0; idle=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             round=$((round+1))
             echo "===== 第 $round 轮  $(date -u '+%F %T')Z ====="
-            python3 tools/build_jr_stamps.py \
-              --cache .cache --outdir .stage \
-              --workers "$WORKERS" --batch 5 --limit 120 --fail-fast || true
+            out=$(python3 tools/build_jr_stamps.py \
+                    --cache .cache --outdir .stage \
+                    --workers "$WORKERS" --batch 5 --limit 120 --fail-fast 2>&1) || true
+            echo "$out" | tail -40
+            pushed=$(echo "$out" | grep -oE '已推送文件 [0-9]+' | tail -1 | grep -oE '[0-9]+')
+            pushed=${pushed:-0}
+            if [ "$pushed" -eq 0 ]; then
+              idle=$((idle+1)); echo "空转第 $idle 次(本轮 0 产出)"
+              if [ "$idle" -ge 3 ]; then
+                echo "::error::连续 3 轮无产出, 中止本轮"; exit 1
+              fi
+            else
+              idle=0
+            fi
             find .stage -name '*.png' -delete 2>/dev/null || true
             left=$(python3 tools/build_jr_stamps.py --cache .cache --count-only --prefer riders 2>/dev/null \
                    | grep -oP '待生产 \K[0-9]+' | head -1 || echo 1)
