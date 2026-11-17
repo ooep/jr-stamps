@@ -100,9 +100,13 @@ def line_tint(im, hex_color, keep_accent=True, sat_boost=1.0,
             np.log(0.55) / np.log(max(1e-3, min(0.999, m))), 0.55, 1.35))
     d = np.power(d, gamma) * deepen          # 压深中间调 -> 更浓的墨
 
-    # 纸端只混少量线路色(保持干净), 墨端直接到线路色甚至略深
+    # 纸端只混少量线路色(保持干净), 墨端直接到线路色甚至略深。
+    # 浅色线路(総武線明黄等)若照原亮度压印, 在白底上细节会糊掉,
+    # 因此按线路色自身亮度把墨端压深一档: 深色不动, 越亮压得越多。
+    tl = float(tgt @ np.array([0.299, 0.587, 0.114], dtype=np.float32))
+    k_dark = float(np.clip(0.86 - max(0.0, tl - 160.0) / 60.0 * 0.10, 0.76, 0.86))
     light = 255 + (tgt - 255) * white_amt
-    dark = tgt * 0.86
+    dark = tgt * k_dark
     out = light + (dark - light) * np.clip(d, 0, 1)[..., None]
 
     if sat_boost != 1.0:
