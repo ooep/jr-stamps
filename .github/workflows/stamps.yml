@@ -1,0 +1,67 @@
+name: stamps
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'      # 每 6 小时起一轮（单轮最长约 5.5h）
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: '本次运行时长(小时)'
+        default: '5'
+        required: false
+      workers:
+        description: '并行数'
+        default: '5'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stamps
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装中日韩字体
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk > /dev/null
+
+      - name: 安装依赖
+        run: pip install --quiet pillow
+
+      - name: 恢复清单缓存
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: stamps-cache-v3
+
+      - name: 生产
+        env:
+          LUPI_KEY: ${{ secrets.LUPI_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOURS: ${{ github.event.inputs.hours || '5' }}
+          WORKERS: ${{ github.event.inputs.workers || '5' }}
+        run: |
+          set -u
+          deadline=$(( $(date +%s) + ${HOURS%.*} * 3600 ))
+          round=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            round=$((round+1))
+            echo "===== 第 $round 轮  $(date -u '+%F %T')Z ====="
+            python3 tools/build_jr_stamps.py \
+              --cache .cache --outdir .stage \
+              --workers "$WORKERS" --batch 5 --limit 40 --fail-fast || true
+            find .stage -name '*.png' -delete 2>/dev/null || true
+            left=$(python3 tools/build_jr_stamps.py --cache .cache --count-only --prefer riders 2>/dev/null \
+                   | grep -oP '待生产 \K[0-9]+' | head -1 || echo 1)
+            echo "剩余 $left 站"
+            [ "$left" = "0" ] && break
+            sleep 10
+          done
