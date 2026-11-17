@@ -34,6 +34,11 @@ sys.path.insert(0, HERE)
 
 from PIL import Image
 from stamp_render import render_v2
+try:
+    from line_theme import apply as apply_line_theme
+except ImportError:                       # 工具目录不在 sys.path 时
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from line_theme import apply as apply_line_theme
 
 GH_OWNER, GH_REPO = 'ooep', 'jr-stamps'
 GH_API = 'https://api.github.com'
@@ -228,7 +233,8 @@ def make_stamp(row, key_pool, gh_token, draw_sha, outdir):
         with open(aip, 'wb') as f:
             f.write(png)
         render_v2(aip, os.path.join(outp, row['slug']), op_short(row['op']), name,
-                  brand=BRAND, size=SIZE_OUT, layout='arc', brand_pos='below')
+                  brand=BRAND, size=SIZE_OUT, layout='arc', brand_pos='below',
+                  line_color=row.get('line_color'))
         os.remove(aip)
         # 调色板压缩
         for p in (plain, text):
@@ -299,13 +305,56 @@ def push_batch(token, items, dry=False):
 
 
 
+# ───────────── 线路主题 ─────────────
+SEG_URL = (f'{GH_API}/repos/ooep/floral-salad-8734/contents/'
+           'mini-japanrail-3d/data/segments3d.geojson')
+
+
+def enrich_lines(rows, cache_dir, token):
+    """给每站补 line / line_color; segments3d 本地缓存, 避免每轮重下 11MB"""
+    seg = os.path.join(cache_dir, 'segments3d.json')
+    if os.path.exists(seg) and os.path.getsize(seg) > 1 << 20:
+        try:
+            g = json.load(open(seg, encoding='utf-8'))
+        except Exception:
+            g = None
+    else:
+        g = None
+    if g is None:
+        try:
+            print('拉取线路段数据(segments3d)...', flush=True)
+            raw = http(SEG_URL, headers={'Authorization': 'Bearer ' + token,
+                                         'Accept': 'application/vnd.github.raw'}, timeout=300)
+            g = json.loads(raw)
+            os.makedirs(cache_dir, exist_ok=True)
+            json.dump(g, open(seg, 'w', encoding='utf-8'), ensure_ascii=False)
+        except Exception as e:
+            print('  线路数据不可用(%s), 全部回退藏青' % str(e)[:60], flush=True)
+            for r in rows:
+                r.setdefault('line', '')
+                r.setdefault('line_color', '#1F3A66')
+            return rows
+    rows, stat = apply_line_theme(rows, g)
+    print('线路主题: %d/%d 站匹配到线路 (%.0f%%)'
+          % (stat['with_line'], stat['total'], stat['with_line'] * 100.0 / max(1, stat['total'])), flush=True)
+    return rows
+
+
 # ───────────── 自举: 构建站点清单 ─────────────
 def prepare(cache_dir, token):
     """从 JR-images + 主站数据构建 worklist.json / drawsha.json"""
     os.makedirs(cache_dir, exist_ok=True)
     wl, ds = os.path.join(cache_dir, 'worklist.json'), os.path.join(cache_dir, 'drawsha.json')
     if os.path.exists(wl) and os.path.exists(ds):
-        print('清单已存在:', wl); return wl, ds
+        print('清单已存在:', wl)
+        try:
+            rows = json.load(open(wl, encoding='utf-8'))
+        except Exception:
+            rows = None
+        if rows and rows and 'line_color' not in rows[0]:
+            rows = enrich_lines(rows, cache_dir, token)
+            json.dump(rows, open(wl, 'w'), ensure_ascii=False)
+        return wl, ds
 
     print('拉取 JR-images 站点表...', flush=True)
     sa = json.loads(http(f'{GH_API}/repos/ooep/JR-images/contents/data/stations_all.json',
@@ -389,6 +438,7 @@ def prepare(cache_dir, token):
                          pdir=pdir, path=path, op=resolve_op(st),
                          riders=st.get('riders') or 0))
     rows.sort(key=lambda r: (r['pdir'], r['id']))
+    rows = enrich_lines(rows, cache_dir, token)
     json.dump(rows, open(wl, 'w'), ensure_ascii=False)
     json.dump(sha, open(ds, 'w'))
     print(f'清单构建完成: {len(rows)} 站可用, 缺站图 {miss}')

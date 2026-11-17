@@ -12,6 +12,116 @@ from stamp_typography import (load_art, to_transparent, F, adv, line_width,
 from PIL import Image, ImageDraw, ImageFilter
 
 
+# ─────────── 线路色渲染 ───────────
+def _hex2rgb(h):
+    h = h.lstrip('#')
+    if len(h) == 3:
+        h = ''.join(c * 2 for c in h)
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _to_hsl(rgb):
+    r, g, b = [v / 255.0 for v in rgb]
+    mx, mn = max(r, g, b), min(r, g, b)
+    l = (mx + mn) / 2
+    if mx == mn:
+        return 0.0, 0.0, l
+    d = mx - mn
+    sat = d / (2 - mx - mn) if l > 0.5 else d / (mx + mn)
+    if mx == r:
+        h = ((g - b) / d + (6 if g < b else 0)) / 6
+    elif mx == g:
+        h = ((b - r) / d + 2) / 6
+    else:
+        h = ((r - g) / d + 4) / 6
+    return h, sat, l
+
+
+def _from_hsl(h, sat, l):
+    if sat <= 0:
+        v = int(round(l * 255)); return (v, v, v)
+    q = l * (1 + sat) if l < 0.5 else l + sat - l * sat
+    p = 2 * l - q
+
+    def f(t):
+        t = t % 1.0
+        if t < 1 / 6: return p + (q - p) * 6 * t
+        if t < 1 / 2: return q
+        if t < 2 / 3: return p + (q - p) * (2 / 3 - t) * 6
+        return p
+    return tuple(int(round(max(0, min(1, f(h + d))) * 255)) for d in (1 / 3, 0, -1 / 3))
+
+
+def readable_ink(hex_color, target_lum=84, sat_boost=1.0):
+    """把线路色压成可读的墨色: 保留色相, 亮度拉到 target_lum, 饱和度可选增强"""
+    h, s, l = _to_hsl(_hex2rgb(hex_color))
+    s = min(1.0, s * sat_boost + 0.08)
+    # 由亮度目标反解 L
+    tl = target_lum / 255.0
+    cand = _from_hsl(h, s, tl)
+    if abs(0.299 * cand[0] + 0.587 * cand[1] + 0.114 * cand[2] - target_lum) > 12:
+        lo, hi = 0.0, tl
+        for _ in range(24):
+            mid = (lo + hi) / 2
+            c = _from_hsl(h, s, mid)
+            lm = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+            if lm > target_lum:
+                hi = mid
+            else:
+                lo = mid
+        cand = _from_hsl(h, s, (lo + hi) / 2)
+    return cand
+
+
+def line_tint(im, hex_color, keep_accent=True, sat_boost=1.0,
+              gamma=None, white_amt=0.22, deepen=1.0):
+    """把(深蓝墨)印章图案整体重着色为该线路的饱和色。
+
+    做法不是"混色", 而是**油墨覆盖**: 以墨密度 d 为权重, 从近乎白的纸色
+    压到线路色本体, 再对 d 做 gamma 压深, 让中间调偏向满色 —— 这样细密的
+    木刻排线仍然保持浓墨观感, 不会糊成水彩。
+    """
+    base = np.asarray(im.convert('RGBA')).astype(np.float32)
+    rgb, al = base[..., :3], base[..., 3]
+    lum = rgb @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+    tgt = np.array(_hex2rgb(hex_color), dtype=np.float32)
+    op = al > 40
+    if op.sum() < 200:
+        return im
+    lo = float(np.percentile(lum[op], 3))
+    hi = float(np.percentile(lum[op], 97))
+    d = np.clip((hi - lum) / max(6.0, hi - lo), 0, 1)
+
+    # 自适应: 让每张图的平均墨量观感一致(原图对比度低的会被压深)
+    if gamma is None or gamma <= 0:
+        m = float(d[op].mean())
+        gamma = 0.95 if m <= 1e-6 else float(np.clip(
+            np.log(0.55) / np.log(max(1e-3, min(0.999, m))), 0.55, 1.35))
+    d = np.power(d, gamma) * deepen          # 压深中间调 -> 更浓的墨
+
+    # 纸端只混少量线路色(保持干净), 墨端直接到线路色甚至略深
+    light = 255 + (tgt - 255) * white_amt
+    dark = tgt * 0.86
+    out = light + (dark - light) * np.clip(d, 0, 1)[..., None]
+
+    if sat_boost != 1.0:
+        # 保色相提升饱和度: 相对灰度做一次外推
+        g = out @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        out = g[..., None] + (out - g[..., None]) * sat_boost
+
+    if keep_accent:
+        r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+        warm = (r > b + 26) & (r > 90) & op
+        if warm.sum() > 30:
+            acc = np.stack([np.full_like(r, 190), np.full_like(r, 42), np.full_like(r, 34)], -1)
+            k = warm[..., None].astype(np.float32) * 0.95
+            out = out * (1 - k) + acc * k
+
+    out = np.clip(out, 0, 255)
+    return Image.fromarray(np.dstack([out, al]).astype(np.uint8), 'RGBA')
+
+
 def ink_color(art_path, deepen=0.94, src_img=None):
     """从印章主图提取印泥主色: 「饱和×暗」高分区的中位数。
        自动跟随每张图的主色调; 太浅时压深保证可读。"""
@@ -61,16 +171,24 @@ def fit_arc_span(text, radius, f_factory, track_deg, max_deg):
 
 def render_v2(art_path, out_base, top, name, brand='MiniJapanRail',
               size=2048, layout='arc', brand_pos='below',
-              ink=None, with_text=True, save_plain=True):
+              ink=None, with_text=True, save_plain=True, line_color=None,
+              sat_boost=1.0):
     """brand_pos: below(站名弧下方) | sides(左右竖排) | outer(最外圈小弧)"""
     src, cx, cy, R = load_art(art_path)
     base, CX, CY, RR = to_transparent(src, size, cx, cy, R)
+    if line_color:
+        base = line_tint(base, line_color, sat_boost=sat_boost)
     if save_plain:
         base.save(out_base + '.png')
     if not with_text:
         return out_base + '.png'
 
-    icol = ink or ink_color(art_path, src_img=src)
+    if ink:
+        icol = ink
+    elif line_color:
+        icol = readable_ink(line_color, target_lum=84, sat_boost=sat_boost)
+    else:
+        icol = ink_color(art_path, src_img=src)
     im = base.copy()
 
     # ── 上弧: 运营方 ──
