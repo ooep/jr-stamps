@@ -329,7 +329,8 @@ def enrich_lines(rows, cache_dir, token):
             os.makedirs(cache_dir, exist_ok=True)
             json.dump(g, open(seg, 'w', encoding='utf-8'), ensure_ascii=False)
         except Exception as e:
-            print('  线路数据不可用(%s), 全部回退藏青' % str(e)[:60], flush=True)
+            keep = sum(1 for r in rows if r.get('line_color'))
+            print('  线路数据不可用(%s), 保留已有配色 %d 站' % (str(e)[:60], keep), flush=True)
             for r in rows:
                 r.setdefault('line', '')
                 r.setdefault('line_color', '#1F3A66')
@@ -351,9 +352,14 @@ def prepare(cache_dir, token):
             rows = json.load(open(wl, encoding='utf-8'))
         except Exception:
             rows = None
-        if rows and rows and 'line_color' not in rows[0]:
+        if rows:
+            before = {(r.get('id'), r.get('line_color')) for r in rows}
             rows = enrich_lines(rows, cache_dir, token)
-            json.dump(rows, open(wl, 'w'), ensure_ascii=False)
+            after = {(r.get('id'), r.get('line_color')) for r in rows}
+            if before != after:
+                changed = len(after - before) if len(after) >= len(before) else len(before - after)
+                print('  配色规则更新, %d 站线路色已刷新' % max(changed, 1), flush=True)
+                json.dump(rows, open(wl, 'w'), ensure_ascii=False)
         return wl, ds
 
     print('拉取 JR-images 站点表...', flush=True)

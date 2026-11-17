@@ -65,6 +65,15 @@ STATION_LINE_OVERRIDE = {
     '北千住': '常磐線', '西船橋': '総武線', '町田': '横浜線',
 }
 
+# (都道府県, 站名) -> 线路; '' 表示强制回退藏青(数据集无该线路色)
+# 用于同名站消歧: 千葉站被数据集同时挂到千葉都市モノレール, 群馬的中野实为上信電鉄
+PREF_OVERRIDE = {
+    ('千葉県', '千葉'): '総武線',
+    ('群馬県', '中野'): '上信線',
+    ('群馬県', '前橋'): '両毛線',
+    ('栃木県', '宇都宮'): '東北線',
+}
+
 _NEUTRAL_TOL = 18   # 灰度容差: 过灰的线路色不优先
 
 
@@ -105,7 +114,7 @@ def build_index(geojson):
 
 
 def resolve(station_name, station_lines, line_color, line_segs,
-            station_override=None, line_override=None):
+            station_override=None, line_override=None, pref=None):
     """返回 (line 或 None, color)。color 一定可用(无匹配时回退藏青)。"""
     so = STATION_LINE_OVERRIDE if station_override is None else station_override
     lo = LINE_COLOR_OVERRIDE if line_override is None else line_override
@@ -113,14 +122,24 @@ def resolve(station_name, station_lines, line_color, line_segs,
     base = station_name.split('(')[0]
     station_name = station_name.strip()
 
+    forced_key = next((k for k in ((pref, station_name), (pref, base))
+                       if pref and k in PREF_OVERRIDE), None)
+    if forced_key:
+        forced = PREF_OVERRIDE[forced_key]
+        if not forced:
+            return None, DEFAULT_INK
+        return forced, (lo.get(forced) or line_color.get(forced) or DEFAULT_INK)
+
     line = so.get(station_name) or so.get(base)
     if line and line not in line_color:
         line = None            # 覆盖项在这个数据集里没色 -> 走自动
 
     if not line:
-        c = {l: v for l, v in station_lines.get(base, {}).items() if '新幹線' not in l}
+        # 完整站名优先(带"群馬県"之类后缀的站名不会串到同名站)
+        full = station_lines.get(station_name) or station_lines.get(base) or {}
+        c = {l: v for l, v in full.items() if '新幹線' not in l}
         if not c:
-            c = dict(station_lines.get(station_name, {}))
+            c = dict(full)          # 新干线专属站(新函館北斗/岐阜羽島等): 保留新干线色
         if c:
             skip_grey = {l: v for l, v in c.items() if not _grey(line_color.get(l))}
             c = skip_grey or c
@@ -130,12 +149,13 @@ def resolve(station_name, station_lines, line_color, line_segs,
     return line, color
 
 
-def apply(rows, geojson, key_name='name'):
+def apply(rows, geojson, key_name='name', pref_key='pref'):
     """原地给 worklist 行补 line / line_color 字段"""
     station_lines, line_color, line_segs = build_index(geojson)
     n_line = n_color = 0
     for r in rows:
-        line, color = resolve(r.get(key_name) or '', station_lines, line_color, line_segs)
+        line, color = resolve(r.get(key_name) or '', station_lines, line_color, line_segs,
+                              pref=r.get(pref_key))
         r['line'] = line or ''
         r['line_color'] = color
         if line:
