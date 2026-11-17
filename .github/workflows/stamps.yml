@@ -2,16 +2,16 @@ name: stamps
 
 on:
   schedule:
-    - cron: '0 */6 * * *'      # 每 6 小时起一轮（单轮最长约 5.5h）
+    - cron: '15 */7 * * *'     # 每 7 小时起一轮（单轮约 6h，留出余量）
   workflow_dispatch:
     inputs:
       hours:
         description: '本次运行时长(小时)'
-        default: '5'
+        default: '6'
         required: false
       workers:
         description: '并行数'
-        default: '5'
+        default: '12'
         required: false
 
 permissions:
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 380
     steps:
       - uses: actions/checkout@v4
 
@@ -44,10 +44,10 @@ jobs:
 
       - name: 生产
         env:
-          LUPI_KEY: ${{ secrets.LUPI_KEY }}
+          LUPI_KEYS: ${{ secrets.LUPI_KEY }}${{ secrets.LUPI_KEY_2 != '' && format(',{0}', secrets.LUPI_KEY_2) || '' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOURS: ${{ github.event.inputs.hours || '5' }}
-          WORKERS: ${{ github.event.inputs.workers || '5' }}
+          HOURS: ${{ github.event.inputs.hours || '6' }}
+          WORKERS: ${{ github.event.inputs.workers || '12' }}
         run: |
           set -u
           deadline=$(( $(date +%s) + ${HOURS%.*} * 3600 ))
@@ -57,7 +57,7 @@ jobs:
             echo "===== 第 $round 轮  $(date -u '+%F %T')Z ====="
             python3 tools/build_jr_stamps.py \
               --cache .cache --outdir .stage \
-              --workers "$WORKERS" --batch 5 --limit 40 --fail-fast || true
+              --workers "$WORKERS" --batch 5 --limit 120 --fail-fast || true
             find .stage -name '*.png' -delete 2>/dev/null || true
             left=$(python3 tools/build_jr_stamps.py --cache .cache --count-only --prefer riders 2>/dev/null \
                    | grep -oP '待生产 \K[0-9]+' | head -1 || echo 1)

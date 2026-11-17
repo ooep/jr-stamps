@@ -27,6 +27,7 @@ build_jr_stamps.py — 车站印章批量生产 → 推送到 ooep/jr-stamps
 import argparse, base64, csv, io, json, math, os, sys, time
 import urllib.request, urllib.error, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -120,6 +121,26 @@ def op_short(name):
 
 
 # ───────────── Lupi ─────────────
+class KeyPool:
+    """多账号 Lupi key 轮转, 让并发可以按 key 数量线性扩容"""
+
+    def __init__(self, keys):
+        self.keys = [k for k in keys if k]
+        self._i = 0
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self.keys)
+
+    def get(self):
+        with self._lock:
+            if not self.keys:
+                raise RuntimeError('无可用 Lupi key')
+            k = self.keys[self._i % len(self.keys)]
+            self._i += 1
+            return k
+
+
 def lupi_edit(key, art_bytes, prompt):
     boundary = '----b' + str(int(time.time() * 1000))
     parts = []
@@ -180,7 +201,7 @@ def gen_art(key, art_bytes, retries=4):
 
 
 # ───────────── 单站生产 ─────────────
-def make_stamp(row, lupi_key, gh_token, draw_sha, outdir):
+def make_stamp(row, key_pool, gh_token, draw_sha, outdir):
     sid, name = row['id'], row['name']
     pdir = row['pdir']
     outp = os.path.join(outdir, pdir)
@@ -197,7 +218,7 @@ def make_stamp(row, lupi_key, gh_token, draw_sha, outdir):
     with open(ai, 'wb') as f:
         f.write(art)
     try:
-        png = gen_art(lupi_key, art)
+        png = gen_art(key_pool.get(), art)
         if not png:
             raise RuntimeError('gen_failed')
         aip = os.path.join(outdir, f'.ai_{sid}.png')
@@ -407,9 +428,12 @@ def main():
     ap.add_argument('--fail-fast', action='store_true', help='首站失败即中止本轮')
     a = ap.parse_args()
 
-    lupi_key, token = os.environ.get('LUPI_KEY'), os.environ.get('GH_TOKEN')
-    if not lupi_key or not token:
-        sys.exit('E: 需要 LUPI_KEY 与 GH_TOKEN 环境变量')
+    raw_keys = os.environ.get('LUPI_KEYS') or os.environ.get('LUPI_KEY') or ''
+    keys = [k.strip() for k in raw_keys.replace('\n', ',').replace(' ', ',').split(',') if k.strip()]
+    key_pool = KeyPool(keys)
+    token = os.environ.get('GH_TOKEN')
+    if not keys or not token:
+        sys.exit('E: 需要 LUPI_KEY(或 LUPI_KEYS) 与 GH_TOKEN 环境变量')
 
     cache = a.cache
     wl, ds = a.worklist, a.draw_sha
@@ -418,7 +442,7 @@ def main():
     if a.prepare:
         print('清单:', wl); return
     if a.probe_only:
-        ok = upstream_alive(lupi_key, a.probe_art)
+        ok = upstream_alive(key_pool.get(), a.probe_art)
         print('上游探活:', {True: 'OK', False: 'FAIL', None: 'SKIP(无参考图)'}[ok], flush=True)
         sys.exit(0 if ok is not False else 1)
 
@@ -449,7 +473,7 @@ def main():
     _ok_seen = False
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        futs = {ex.submit(make_stamp, r, lupi_key, token, draw_sha, a.outdir): r for r in rows}
+        futs = {ex.submit(make_stamp, r, key_pool, token, draw_sha, a.outdir): r for r in rows}
         for fu in as_completed(futs):
             r = futs[fu]
             try:
