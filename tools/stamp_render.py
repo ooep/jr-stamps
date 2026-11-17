@@ -15,10 +15,22 @@ from PIL import Image, ImageDraw, ImageFilter
 def ink_color(art_path, deepen=0.94, src_img=None):
     """从印章主图提取印泥主色: 「饱和×暗」高分区的中位数。
        自动跟随每张图的主色调; 太浅时压深保证可读。"""
-    im = (src_img or Image.open(art_path)).convert('RGB')
+    if src_img is not None:
+        im = src_img
+    else:
+        im = Image.open(art_path)
+    has_alpha = im.mode in ('RGBA', 'LA') or 'transparency' in im.info
+    al = np.asarray(im.convert('RGBA'))[..., 3] if has_alpha else None
+    im = im.convert('RGB')
     arr = np.asarray(im.filter(ImageFilter.MedianFilter(3))).astype(np.float32)
     lum = arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-    m = lum < 200
+    if al is not None and float(np.mean(al < 30)) > 0.02:
+        # 原生透明底: 只取有墨(alpha 高)的区域, 否则透明区的黑色会把主色拉黑
+        m = (al > 200) & (lum < 210)
+        if m.sum() < 500:
+            m = (al > 120) & (lum < 210)
+    else:
+        m = lum < 200
     if not m.any():
         return (30, 45, 90)
     ink, ilum = arr[m], lum[m]

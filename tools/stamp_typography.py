@@ -76,22 +76,56 @@ def draw_arc(im, text, cx, cy, radius, f, fill, track_deg=0.0, center_deg=270.0,
         im.alpha_composite(tile, (int(round(x - tile.width/2)), int(round(y - tile.height/2))))
 
 def load_art(path):
-    src = Image.open(path).convert('RGB')
+    """载入印章图; 保留 alpha, 以便用原生透明底抠图"""
+    im = Image.open(path)
+    has_alpha = im.mode in ('RGBA', 'LA') or 'transparency' in im.info
+    src = im.convert('RGBA')
     if src.size[0] != src.size[1]:
-        s = max(src.size); sq = Image.new('RGB', (s,s), (255,255,255))
-        sq.paste(src, ((s-src.size[0])//2, (s-src.size[1])//2)); src = sq
-    arr = np.asarray(src.filter(ImageFilter.MedianFilter(3))).astype(np.float32)
+        s = max(src.size); sq = Image.new('RGBA', (s, s), (255, 255, 255, 0))
+        sq.paste(src, ((s-src.size[0])//2, (s-src.size[1])//2), src); src = sq
+    arr = np.asarray(src.convert('RGB').filter(ImageFilter.MedianFilter(3))).astype(np.float32)
     lum = arr @ np.array([0.299,0.587,0.114], dtype=np.float32)
-    ys, xs = np.where(lum < 200)
-    return src, (xs.min()+xs.max())/2, (ys.min()+ys.max())/2, max(xs.max()-xs.min(), ys.max()-ys.min())/2
+    al = np.asarray(src)[..., 3]
+    m = (lum < 200) if al.min() >= 250 else ((al > 40) & (lum < 230))
+    if not m.any():
+        m = lum < 200
+    ys, xs = np.where(m)
+    return (src if has_alpha else src.convert('RGB')), \
+           (xs.min()+xs.max())/2, (ys.min()+ys.max())/2, \
+           max(xs.max()-xs.min(), ys.max()-ys.min())/2
 
-def to_transparent(src, size, cx, cy, R, hi=185, lo=115):
+def to_transparent(src, size, cx, cy, R, hi=185, lo=115, floor=110):
+    """转透明底。
+
+    优先使用 AI 生成的原生 alpha（提示词已要求透明底）；若图片不带透明信息，
+    回退到旧策略：按亮度抠底（亮纸底→0，深墨色→不透明）。
+    floor: 有墨区域的最低不透明度，避免极淡细节在压缩后丢失。
+    """
     sc = size / src.size[0]
     im = src.resize((size, size), Image.LANCZOS)
     arr = np.asarray(im).astype(np.float32)
-    lum = arr @ np.array([0.299,0.587,0.114], dtype=np.float32)
-    a = np.clip((hi - lum) / max(1, hi - lo), 0, 1) * 255
-    out = Image.fromarray(np.dstack([arr.astype(np.uint8), a.astype(np.uint8)]), 'RGBA')
+    if arr.ndim == 2:
+        arr = np.dstack([arr] * 3)
+    rgb = arr[..., :3]
+    lum = rgb @ np.array([0.299,0.587,0.114], dtype=np.float32)
+
+    native = None
+    if arr.shape[2] == 4:
+        an = arr[..., 3]
+        if float(np.mean(an < 30)) > 0.02:      # 有意义透明区才认作原生透明底
+            native = an
+
+    if native is not None:
+        a = np.clip((native - 12) * (255.0 / 243.0), 0, 255)
+        # 部分模型在半透明像素下预乘成黑，反预乘以免墨色发脏
+        af = np.clip(a / 255.0, 1e-3, 1.0)[..., None]
+        rgb = np.where((native < 250)[..., None] & (rgb.max(axis=2, keepdims=True) < 40),
+                       np.clip(rgb / af, 0, 255), rgb)
+        a = np.maximum(a, np.where(native > 20, floor, 0))
+    else:
+        a = np.clip((hi - lum) / max(1, hi - lo), 0, 1) * 255
+
+    out = Image.fromarray(np.dstack([rgb.astype(np.uint8), a.astype(np.uint8)]), 'RGBA')
     m = Image.new('L', (size, size), 0)
     C, CY, RR = cx*sc, cy*sc, R*sc
     ImageDraw.Draw(m).ellipse((C-RR, CY-RR, C+RR, CY+RR), fill=255)

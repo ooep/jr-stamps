@@ -43,12 +43,14 @@ BRAND = 'MiniJapanRail'
 SIZE_OUT = 1024
 PALETTE = 32
 
-PROMPT = ('将这张车站插画改绘成一枚复古风格的圆形印章图案：奶油色纸底，'
+PROMPT = ('将这张车站插画改绘成一枚复古风格的圆形印章图案。'
+          '极其重要：背景必须完全透明（PNG 透明通道，alpha=0），'
+          '不要纸底、不要米色/白色/任何纯色背景，只有印章图案本身有颜色。'
           '深蓝色油墨的线条与色块刻画车站建筑与场景，天空中一枚小小的朱红色圆点作为点缀，'
           '油墨浓淡略有变化，带有手工盖章的粗糙质感；外围有圆形双线边框，'
-          '画面中不要出现任何文字、字母或数字。正方形构图，图案铺满画面。')
-PROMPT_FALLBACK = ('将参考图片改绘成深蓝色单色的日式橡皮印章图案，木刻版画线条，'
-                   '带圆形边框，画面中不要出现任何文字。正方形构图。')
+          '画面中不要出现任何文字、字母或数字。正方形构图。')
+PROMPT_FALLBACK = ('把参考图改绘成深蓝色单色的日式橡皮印章图案，木刻版画线条，带圆形边框，'
+                   '背景完全透明（PNG alpha 透明，无任何底色），画面中不要出现任何文字。正方形构图。')
 
 # 运营方官方名 → 印章用短名
 # JR 六社属地(用于运营方消歧)
@@ -146,6 +148,7 @@ def lupi_edit(key, art_bytes, prompt):
     parts = []
     for k, v in (('model', 'gpt-image-2.5'), ('prompt', prompt), ('n', '1'),
                  ('size', '1024x1024'), ('quality', 'high'),
+                 ('background', 'transparent'), ('output_format', 'png'),
                  ('response_format', 'url'), ('async', 'true')):
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="s.jpg"\r\n'
@@ -506,9 +509,10 @@ def main():
                 try:
                     n = push_batch(token, pending, a.dry_run)
                     print(f'  ↑ 推送 {n} 个文件', flush=True)
-                    for _, p in pending:
-                        try: os.remove(p)
-                        except OSError: pass
+                    if not a.dry_run:
+                        for _, p in pending:
+                            try: os.remove(p)
+                            except OSError: pass
                     pending = []
                     pushed_total += n
                 except Exception as e:
@@ -518,9 +522,10 @@ def main():
         try:
             n = push_batch(token, pending, a.dry_run)
             print(f'  ↑ 收尾推送 {n} 个文件', flush=True)
-            for _, p in pending:
-                try: os.remove(p)
-                except OSError: pass
+            if not a.dry_run:
+                for _, p in pending:
+                    try: os.remove(p)
+                    except OSError: pass
         except Exception as e:
             print(f'  ✗ 收尾推送失败({str(e)[:60]}), 文件保留', flush=True)
     print(f'完成 {done_cnt} 站, 失败 {fail}, 已推送文件 {pushed_total}', flush=True)
