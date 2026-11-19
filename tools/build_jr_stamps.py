@@ -584,6 +584,13 @@ def main():
         print(f'  \u2191 {tag}\u63a8\u9001 {n} \u4e2a\u6587\u4ef6', flush=True)
         forced -= pending_forced
         pending_forced.clear()
+        # 关键: 同步写回本地清单, 下一轮(新进程)才能读到收缩后的结果
+        if a.force_list and not a.dry_run:
+            try:
+                with open(a.force_list, 'w', encoding='utf-8') as f:
+                    json.dump(sorted(forced), f)
+            except OSError:
+                pass
         if tmp and os.path.exists(tmp):
             try: os.remove(tmp)
             except OSError: pass
