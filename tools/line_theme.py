@@ -17,6 +17,7 @@ segments3d 的 from/to 只是 segment 端点, 长区间的中间站不会出现(
   2. 用 LINE_COLOR_OVERRIDE 修正明显取色错误(如中央線被数据集并入中央·総武线取到蓝色);
   3. 都没有则回退默认藏青(indigo), 不硬凑。
 """
+import math
 from collections import Counter, defaultdict
 
 DEFAULT_INK = '#1F3A66'      # 回退藏青(与旧版一致)
@@ -90,12 +91,44 @@ def _grey(hex_color):
     return max(r, g, b) - min(r, g, b) < _NEUTRAL_TOL
 
 
+GRID = 0.01          # ~1.1km 网格, 用于「线路是否经过该站」的邻域检索
+NEAR_ENDPOINT = 2.0  # km: 端点同名站 + 位置吻合才算同一站
+NEAR_LINE = 0.9      # km: 线路几何经过站点的最大距离
+
+
+def _flat(coords, out):
+    for c in coords:
+        if isinstance(c[0], (list, tuple)):
+            _flat(c, out)
+        else:
+            out.append((float(c[0]), float(c[1])))
+
+
+def _km(lon1, lat1, lon2, lat2):
+    k = math.cos(math.radians((lat1 + lat2) * 0.5))
+    return math.hypot((lon1 - lon2) * k * 111.0, (lat1 - lat2) * 111.0)
+
+
+def _cell(lon, lat):
+    return (int(math.floor(lon / GRID)), int(math.floor(lat / GRID)))
+
+
 def build_index(geojson):
-    """segments3d.geojson -> (station_lines, line_color, line_segs)"""
+    """segments3d.geojson -> (station_lines, line_color, line_segs, geo)
+
+    geo = (endpoint, grid, line_op):
+      endpoint[name]      -> [(lon, lat, line)]   段端点坐标(用于同名站消歧)
+      grid[(cx,cy)]       -> [(lon, lat, line)]   线路采样点(用于「线路是否经过」)
+      line_op[line]       -> Counter(op)          线路运营方分布
+    """
     feats = geojson.get('features') if isinstance(geojson, dict) else geojson
     line_color, line_segs = {}, Counter()
     station_lines = defaultdict(Counter)
     cand = defaultdict(Counter)
+    endpoint = defaultdict(list)
+    grid = defaultdict(list)
+    line_pts = defaultdict(list)
+    line_op = defaultdict(Counter)
     for f in feats:
         p = f.get('properties') or {}
         ln = p.get('line')
@@ -105,17 +138,117 @@ def build_index(geojson):
         c = p.get('color')
         if c:
             cand[ln][c] += 1
+        op = p.get('op')
+        if op:
+            line_op[ln][op] += 1
         for s in (p.get('from'), p.get('to')):
             if s:
                 station_lines[s][ln] += 1
+        geom = f.get('geometry') or {}
+        pts = []
+        try:
+            _flat(geom.get('coordinates') or [], pts)
+        except Exception:
+            pts = []
+        for pt in pts:
+            grid[_cell(pt[0], pt[1])].append((pt[0], pt[1], ln))
+            line_pts[ln].append(pt)
+        if pts:
+            for nm, pt in ((p.get('from'), pts[0]), (p.get('to'), pts[-1])):
+                if nm:
+                    endpoint[nm].append((pt[0], pt[1], ln))
     for ln, c in cand.items():
         line_color[ln] = c.most_common(1)[0][0]
-    return station_lines, line_color, line_segs
+    return station_lines, line_color, line_segs, (endpoint, grid, line_op, line_pts)
+
+
+def _lines_near_grid(grid, lon, lat, radius_km=NEAR_LINE):
+    """线路几何距站点 radius_km 以内的线路名集合"""
+    reach = int(math.ceil(radius_km / 100.0 / GRID)) + 1
+    cx, cy = _cell(lon, lat)
+    hit = Counter()
+    for ix in range(cx - reach, cx + reach + 1):
+        for iy in range(cy - reach, cy + reach + 1):
+            for (x, y, ln) in grid.get((ix, iy), ()):
+                d = _km(lon, lat, x, y)
+                if d <= radius_km:
+                    hit[ln] += 1
+    return hit
+
+
+def _dist_to_line(line, lon, lat, geo, cap=1e9):
+    """站点到某线路几何的最近距离(km), 超出 cap 立即返回 cap"""
+    if not geo or lon is None or lat is None:
+        return 0.0
+    pts = geo[3].get(line) or ()
+    if not pts:
+        return float('inf')     # 数据集没有这条线的几何 -> 无法校验, 按"远"处理
+    k = math.cos(math.radians(lat))
+    best = float('inf')
+    for (x, y) in pts:
+        d = math.hypot((x - lon) * k * 111.0, (y - lat) * 111.0)
+        if d < best:
+            best = d
+            if best < 0.05:
+                break
+    return best
+
+
+def left_ok(line, lon, lat, geo):
+    """数据集里没有该线路几何时(无坐标可比), 不拦截都道府県覆盖"""
+    return not geo or not (geo[3].get(line)) or lon is None
+
+
+def _op_bonus(line, op, geo):
+    """同运营方优先(共站枢纽: 东京站 JR 与地铁不会互相顶掉)"""
+    if not op or not geo:
+        return 0
+    ops = geo[2].get(line)
+    return 1 if ops and ops.get(op) else 0
+
+
+def _candidates(station_name, base, station_lines, line_segs, lon, lat, op, geo):
+    """候选线路 -> 权重。
+
+    有坐标: 端点同名且<=NEAR_ENDPOINT 的线路优先; 若无, 用几何邻域
+    (覆盖长区间跳过中间站的情况)。无坐标: 退回纯站名统计(旧行为)。
+    """
+    if lon is None or lat is None or not geo:
+        full = station_lines.get(station_name) or station_lines.get(base) or {}
+        c = {l: v for l, v in full.items() if '新幹線' not in l}
+        return c or dict(full)
+
+    endpoint, grid = geo[0], geo[1]
+    near = {}
+    for nm in (station_name, base):
+        for (x, y, ln) in endpoint.get(nm, ()):
+            if _km(lon, lat, x, y) <= NEAR_ENDPOINT:
+                near[ln] = near.get(ln, 0) + 2      # 同名且位置吻合, 权重最高
+    if not near:
+        near = dict(_lines_near_grid(grid, lon, lat))   # 线路几何经过该站
+    if not near:
+        # 几何邻域也没找到: 退回站名统计, 但剔除地理上明显无关的线路
+        full = station_lines.get(station_name) or station_lines.get(base) or {}
+        full = {l: v for l, v in full.items() if '新幹線' not in l} or dict(full)
+        ok = {l: v for l, v in full.items()
+              if _dist_to_line(l, lon, lat, geo) <= 50.0}
+        return ok
+
+    c = {l: v for l, v in near.items() if '新幹線' not in l}
+    if not c:
+        return dict(near)          # 新干线专属站(新函館北斗等): 保留新干线色
+    return c
 
 
 def resolve(station_name, station_lines, line_color, line_segs,
-            station_override=None, line_override=None, pref=None):
-    """返回 (line 或 None, color)。color 一定可用(无匹配时回退藏青)。"""
+            station_override=None, line_override=None, pref=None,
+            lon=None, lat=None, op=None, geo=None):
+    """返回 (line 或 None, color)。color 一定可用(无匹配时回退藏青)。
+
+    给出 lon/lat 时启用地理约束: 只接受端点同名**且位置吻合**的线路,
+    没有则在「几何经过该站的线路」里挑。这样能消灭同名站跨县串线
+    (池田(熊本県) 误挂北海道根室線之类)。
+    """
     so = STATION_LINE_OVERRIDE if station_override is None else station_override
     lo = LINE_COLOR_OVERRIDE if line_override is None else line_override
 
@@ -128,22 +261,28 @@ def resolve(station_name, station_lines, line_color, line_segs,
         forced = PREF_OVERRIDE[forced_key]
         if not forced:
             return None, DEFAULT_INK
-        return forced, (lo.get(forced) or line_color.get(forced) or DEFAULT_INK)
+        # 都道府県覆盖也要过地理校验, 否则同名站会被钉到远方的线上
+        if _dist_to_line(forced, lon, lat, geo, cap=60.0) <= 60.0 \
+                or left_ok(forced, lon, lat, geo):
+            return forced, (lo.get(forced) or line_color.get(forced) or DEFAULT_INK)
 
     line = so.get(station_name) or so.get(base)
     if line and line not in line_color:
         line = None            # 覆盖项在这个数据集里没色 -> 走自动
+    elif line:
+        # 覆盖表是按「站名」写的, 同名异地站(神田/田町/大宮)会被误钉:
+        # 有坐标时要求线路确实经过该站, 否则交给地理归因
+        if _dist_to_line(line, lon, lat, geo, cap=25.0) > 25.0:
+            line = None
 
     if not line:
-        # 完整站名优先(带"群馬県"之类后缀的站名不会串到同名站)
-        full = station_lines.get(station_name) or station_lines.get(base) or {}
-        c = {l: v for l, v in full.items() if '新幹線' not in l}
-        if not c:
-            c = dict(full)          # 新干线专属站(新函館北斗/岐阜羽島等): 保留新干线色
+        c = _candidates(station_name, base, station_lines, line_segs,
+                        lon, lat, op, geo)
         if c:
             skip_grey = {l: v for l, v in c.items() if not _grey(line_color.get(l))}
             c = skip_grey or c
-            line = max(c, key=lambda x: (c[x], -line_segs.get(x, 0)))
+            line = max(c, key=lambda x: (c[x], _op_bonus(x, op, geo),
+                                         -line_segs.get(x, 0)))
 
     color = lo.get(line) or line_color.get(line) or DEFAULT_INK
     return line, color
@@ -151,11 +290,12 @@ def resolve(station_name, station_lines, line_color, line_segs,
 
 def apply(rows, geojson, key_name='name', pref_key='pref'):
     """原地给 worklist 行补 line / line_color 字段"""
-    station_lines, line_color, line_segs = build_index(geojson)
+    station_lines, line_color, line_segs, geo = build_index(geojson)
     n_line = n_color = 0
     for r in rows:
         line, color = resolve(r.get(key_name) or '', station_lines, line_color, line_segs,
-                              pref=r.get(pref_key))
+                              pref=r.get(pref_key), lon=r.get('lon'), lat=r.get('lat'),
+                              op=r.get('op'), geo=geo)
         r['line'] = line or ''
         r['line_color'] = color
         if line:

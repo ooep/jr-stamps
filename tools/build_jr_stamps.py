@@ -310,8 +310,31 @@ SEG_URL = (f'{GH_API}/repos/ooep/floral-salad-8734/contents/'
            'mini-japanrail-3d/data/segments3d.geojson')
 
 
+def ensure_coords(rows, token):
+    """老清单没有经纬度时补上 —— 线路消歧依赖坐标, 否则会跨县串线"""
+    lack = [r for r in rows if r.get('lon') is None or r.get('lat') is None]
+    if not lack:
+        return True
+    try:
+        sa = json.loads(http(f'{GH_API}/repos/ooep/JR-images/contents/data/stations_all.json',
+                             headers={'Authorization': 'Bearer ' + token,
+                                      'Accept': 'application/vnd.github.raw'}, timeout=180))['stations']
+    except Exception as e:
+        print('  坐标补全失败(%s), 线路消歧降级' % str(e)[:50], flush=True)
+        return False
+    pos = {x['id']: (x.get('lon'), x.get('lat')) for x in sa}
+    for r in rows:
+        if r.get('lon') is None or r.get('lat') is None:
+            lon, lat = pos.get(r.get('id'), (None, None))
+            r['lon'], r['lat'] = lon, lat
+    got = sum(1 for r in rows if r.get('lon') is not None)
+    print('  坐标补全: %d/%d 站' % (got, len(rows)), flush=True)
+    return True
+
+
 def enrich_lines(rows, cache_dir, token):
     """给每站补 line / line_color; segments3d 本地缓存, 避免每轮重下 11MB"""
+    ensure_coords(rows, token)
     seg = os.path.join(cache_dir, 'segments3d.json')
     if os.path.exists(seg) and os.path.getsize(seg) > 1 << 20:
         try:
@@ -442,6 +465,7 @@ def prepare(cache_dir, token):
             miss += 1; continue
         rows.append(dict(id=st['id'], slug=st['slug'], name=st['name_key'], pref=st['pref'],
                          pdir=pdir, path=path, op=resolve_op(st),
+                         lon=st.get('lon'), lat=st.get('lat'),
                          riders=st.get('riders') or 0))
     rows.sort(key=lambda r: (r['pdir'], r['id']))
     rows = enrich_lines(rows, cache_dir, token)
@@ -485,6 +509,8 @@ def main():
     ap.add_argument('--count-only', action='store_true', help='仅统计剩余站数后退出')
     ap.add_argument('--probe-art', default=os.path.join(HERE, '東京站_参考站图.jpg'))
     ap.add_argument('--fail-fast', action='store_true', help='首站失败即中止本轮')
+    ap.add_argument('--force-list', default='',
+                    help='JSON 数组(站 id): 忽略「远端已存在」强制重画, 并在推送时同步收缩该列表')
     a = ap.parse_args()
 
     raw_keys = os.environ.get('LUPI_KEYS') or os.environ.get('LUPI_KEY') or ''
@@ -519,7 +545,16 @@ def main():
         print(f'远端已有 {len(done)} 张成品', flush=True)
     except Exception:
         print('远端为空仓库', flush=True)
-    rows = [r for r in rows if f'stamps/{r["pdir"]}/{r["slug"]}.text.png' not in done]
+    forced = set()
+    if a.force_list and os.path.exists(a.force_list):
+        try:
+            forced = {int(x) for x in json.load(open(a.force_list, encoding='utf-8'))}
+            print(f'重画清单: {len(forced)} 站(忽略已有成品)', flush=True)
+        except Exception as e:
+            print('  重画清单读取失败(%s), 忽略' % str(e)[:50], flush=True)
+            forced = set()
+    rows = [r for r in rows
+            if f'stamps/{r["pdir"]}/{r["slug"]}.text.png' not in done or r['id'] in forced]
     if a.count_only:
         print(f'待生产 {len(rows)} 站')
         return
@@ -529,6 +564,39 @@ def main():
     print(f'待生产 {len(rows)} 站, workers={a.workers}, batch={a.batch}', flush=True)
 
     pending, done_cnt, fail, pushed_total = [], 0, 0, 0
+    pending_forced = set()      # 本批完成的强制重画站, 推送成功后从清单剔除
+
+    def flush(items, tag=''):
+        """推送 + 同步收缩重画清单(清单本身也进同一个 commit, 自终止)"""
+        nonlocal forced
+        items = list(items)
+        tmp = None
+        if a.force_list and pending_forced and not a.dry_run:
+            left = sorted(forced - pending_forced)
+            tmp = os.path.join(a.outdir, '_redo.json')
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(left, f)
+                items.append((a.force_list.replace(os.sep, '/'), tmp))
+            except OSError:
+                tmp = None
+        n = push_batch(token, items, a.dry_run)
+        print(f'  \u2191 {tag}\u63a8\u9001 {n} \u4e2a\u6587\u4ef6', flush=True)
+        forced -= pending_forced
+        pending_forced.clear()
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except OSError: pass
+        if a.force_list:
+            print(f'  重画清单剩余 {len(forced)} 站', flush=True)
+        if not a.dry_run:
+            for _, p_ in items:
+                if p_ == tmp:
+                    continue
+                try: os.remove(p_)
+                except OSError: pass
+        return n
+
     _ok_seen = False
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
@@ -542,6 +610,8 @@ def main():
                 row, plain, text = res
                 pending.append((f'stamps/{row["pdir"]}/{row["slug"]}.png', plain))
                 pending.append((f'stamps/{row["pdir"]}/{row["slug"]}.text.png', text))
+                if row['id'] in forced:
+                    pending_forced.add(row['id'])
                 done_cnt += 1
                 _ok_seen = True
                 el = time.time() - t_start
@@ -563,25 +633,14 @@ def main():
 
             if len(pending) >= a.batch * 2:
                 try:
-                    n = push_batch(token, pending, a.dry_run)
-                    print(f'  ↑ 推送 {n} 个文件', flush=True)
-                    if not a.dry_run:
-                        for _, p in pending:
-                            try: os.remove(p)
-                            except OSError: pass
+                    pushed_total += flush(pending)
                     pending = []
-                    pushed_total += n
                 except Exception as e:
                     print(f'  ✗ 推送失败({str(e)[:60]}), 文件保留待重试', flush=True)
 
-    if pending:
+    if pending or (a.force_list and pending_forced):
         try:
-            n = push_batch(token, pending, a.dry_run)
-            print(f'  ↑ 收尾推送 {n} 个文件', flush=True)
-            if not a.dry_run:
-                for _, p in pending:
-                    try: os.remove(p)
-                    except OSError: pass
+            pushed_total += flush(pending, tag='收尾')
         except Exception as e:
             print(f'  ✗ 收尾推送失败({str(e)[:60]}), 文件保留', flush=True)
     print(f'完成 {done_cnt} 站, 失败 {fail}, 已推送文件 {pushed_total}', flush=True)

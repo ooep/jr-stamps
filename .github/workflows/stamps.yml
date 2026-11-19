@@ -62,7 +62,8 @@ jobs:
             echo "===== 第 $round 轮  $(date -u '+%F %T')Z ====="
             out=$(python3 tools/build_jr_stamps.py \
                     --cache .cache --outdir .stage \
-                    --workers "$WORKERS" --batch 5 --limit 120 --fail-fast 2>&1) || true
+                    --workers "$WORKERS" --batch 5 --limit 120 --fail-fast \
+                    $( [ -f tools/redo.json ] && echo --force-list tools/redo.json ) 2>&1) || true
             echo "$out" | tail -40
             pushed=$(echo "$out" | grep -oE '已推送文件 [0-9]+' | tail -1 | grep -oE '[0-9]+')
             pushed=${pushed:-0}
@@ -75,7 +76,8 @@ jobs:
               idle=0
             fi
             find .stage -name '*.png' -delete 2>/dev/null || true
-            left=$(python3 tools/build_jr_stamps.py --cache .cache --count-only --prefer riders 2>/dev/null \
+            left=$(python3 tools/build_jr_stamps.py --cache .cache --count-only --prefer riders \
+                     $( [ -f tools/redo.json ] && echo --force-list tools/redo.json ) 2>/dev/null \
                    | grep -oP '待生产 \K[0-9]+' | head -1 || echo 1)
             echo "剩余 $left 站"
             [ "$left" = "0" ] && break
