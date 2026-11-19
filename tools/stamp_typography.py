@@ -156,7 +156,10 @@ def to_transparent(src, size, cx, cy, R, hi=185, lo=115, floor=110):
     native = None
     if arr.shape[2] == 4:
         an = arr[..., 3]
-        if float(np.mean(an < 30)) > 0.02:      # 有意义透明区才认作原生透明底
+        # 认作原生透明底需同时满足: 有透明区 + 背景本身足够透。
+        # AI 有时只把背景压到 alpha≈14 的"假透明", 会被算成 1~3 的脏底(白底上虽
+        # 看不见, 但严格说不是透明 PNG) —— 这种情况弃用 native, 回退亮度抠图。
+        if float(np.mean(an < 30)) > 0.02 and float(np.median(an)) < 8:
             native = an
 
     if native is not None:
@@ -169,6 +172,7 @@ def to_transparent(src, size, cx, cy, R, hi=185, lo=115, floor=110):
     else:
         a = np.clip((hi - lum) / max(1, hi - lo), 0, 1) * 255
 
+    a = np.where(a < 8, 0.0, a)          # 兜底: 极淡残留一律清成真透明
     out = Image.fromarray(np.dstack([rgb.astype(np.uint8), a.astype(np.uint8)]), 'RGBA')
     m = Image.new('L', (size, size), 0)
     C, CY, RR = cx*sc, cy*sc, R*sc
