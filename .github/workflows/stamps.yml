@@ -13,6 +13,10 @@ on:
         description: '并行数'
         default: '12'
         required: false
+      skip_scan:
+        description: '跳过脏底扫描(1=跳过)'
+        default: ''
+        required: false
 
 permissions:
   contents: write
@@ -40,6 +44,28 @@ jobs:
           python3 -c "import PIL, numpy; print('pillow', PIL.__version__, '| numpy', numpy.__version__)"
           python3 -c "import sys; sys.path.insert(0,'tools'); import stamp_render, stamp_typography, line_theme; print('渲染模块 OK')"
           python3 -c "import sys; sys.path.insert(0,'tools'); from stamp_typography import F; print('字体 OK', F('serif','Bold',48).getbbox('東京駅'))" 
+
+      - name: 扫描脏底(透明底 alpha>0)并生成重画清单
+        if: ${{ ! inputs.skip_scan }}
+        timeout-minutes: 60
+        run: |
+          set -u
+          if [ -d stamps ]; then
+            python3 tools/scan_dirty.py --stamps stamps --out tools/redo.json --workers 4 || true
+          else
+            echo "stamps/ 不存在, 跳过扫描"
+          fi
+          if [ -s tools/redo.json ]; then
+            n=$(python3 -c "import json;print(len(json.load(open('tools/redo.json'))))")
+            echo "待重画 $n 站"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add tools/redo.json
+            git commit -m "chore: 脏底重画清单 ($n 站)"
+            git push origin HEAD:main
+          else
+            echo "无脏底, 全站透明底干净"
+          fi
 
       - name: 恢复清单缓存
         uses: actions/cache@v4
